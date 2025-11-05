@@ -1,11 +1,8 @@
-
-import os
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"  # opcional: silenciar aviso oneDNN
-
+# ===================== PRONÓSTICO + ARANCEL (Streamlit) =====================
 import streamlit as st
 import numpy as np
 import pandas as pd
-import joblib
+import joblib, re
 from pathlib import Path
 from tensorflow.keras.models import load_model
 
@@ -19,7 +16,7 @@ ALADI_F     = 0.88
 # ---- Utilidades de fechas hábiles ----
 def _bd_up(d):
     d = pd.to_datetime(d).normalize()
-    while d.weekday() > 4:  # 0=Lun ... 6=Dom
+    while d.weekday() > 4:
         d += pd.Timedelta(days=1)
     return d
 
@@ -36,14 +33,13 @@ def _som_next(dt):
     return pd.to_datetime(dt).normalize() + pd.offsets.MonthBegin(1)
 
 def quincena_siguiente(ultima_fecha):
-    """Con base en la última fecha del dataset, calcula la siguiente quincena hábil."""
     ultima_fecha = pd.to_datetime(ultima_fecha).normalize()
     if ultima_fecha.day <= 15:
         ini_raw = pd.Timestamp(ultima_fecha.year, ultima_fecha.month, 16)
-        fin_raw = _eom(ultima_fecha)  # fin de mes
+        fin_raw = _eom(ultima_fecha)
     else:
-        ini_raw = _som_next(ultima_fecha)  # 1 del mes siguiente
-        fin_raw = ini_raw + pd.Timedelta(days=14)  # 1..15
+        ini_raw = _som_next(ultima_fecha)
+        fin_raw = ini_raw + pd.Timedelta(days=14)
     return _bd_up(ini_raw), _bd_down(fin_raw)
 
 # ---- Cálculo de arancel ----
@@ -93,43 +89,81 @@ except Exception as e:
     st.error(f"No pude cargar el scaler ({scaler_path}). Detalle: {e}")
     st.stop()
 
-# ---- Carga de archivo CSV (solo 2 primeras columnas) ----
+# ---- Parser robusto de coma decimal -> float ----
+def parse_decimal_comma(x) -> float | None:
+    """
+    Convierte texto con coma decimal a float (punto).
+    Maneja '491,40', '1.234,56', espacios, símbolos, etc.
+    """
+    if pd.isna(x):
+        return None
+    s = str(x).strip().replace('\u00A0', ' ')  # NBSP
+    s = re.sub(r'[^0-9,.\-+]', '', s)         # deja solo dígitos, . , signos
+
+    # Si tiene una sola coma y ningún punto -> coma es decimal
+    if s.count(",") == 1 and s.count(".") == 0:
+        s = s.replace(",", ".")
+    # Si tiene puntos y coma, y la coma está al final -> formato 1.234,56
+    elif s.count(",") == 1 and s.count(".") >= 1 and s.rfind(",") > s.rfind("."):
+        s = s.replace(".", "").replace(",", ".")
+    # Si solo tiene puntos, ya es decimal de punto
+
+    try:
+        return float(s)
+    except:
+        return None
+
+# ---- Lector CSV tolerante (maneja "todo en una columna") ----
+def read_csv_tolerant(file) -> pd.DataFrame:
+    # 1) Intento estándar: coma y comillas
+    df = pd.read_csv(file, sep=",", quotechar='"', engine="python")
+    if df.shape[1] == 1:
+        # 2) Reintentar con punto y coma
+        file.seek(0)
+        df = pd.read_csv(file, sep=";", quotechar='"', engine="python")
+    if df.shape[1] == 1:
+        # 3) Reintentar con separador "inteligente" (regex) respetando comillas
+        file.seek(0)
+        df = pd.read_csv(
+            file,
+            sep=r',(?=(?:[^"]*"[^"]*")*[^"]*$)|;(?=(?:[^"]*"[^"]*")*[^"]*$)',
+            engine="python",
+            header=0
+        )
+    return df
+
+# ---- Carga de archivo (solo 2 primeras columnas: Fecha, Precio) ----
 csv_file = st.file_uploader(
-    "Sube tu archivo CSV (delimitado por comas). Se tomarán SOLO las 2 primeras columnas: Fecha (M/D/Y) y Precio.",
+    "Sube tu archivo CSV. Tomaremos SOLO las 2 primeras columnas: Fecha (dd.mm.yyyy) y Precio (coma decimal).",
     type=["csv"]
 )
 
 def _load_and_normalize_csv(file) -> pd.DataFrame:
-    # 1) Leer CSV tal cual
-    raw = pd.read_csv(file)
+    raw = read_csv_tolerant(file)
 
     if raw.shape[1] < 2:
-        raise ValueError(f"El CSV debe tener al menos 2 columnas. Columnas detectadas: {list(raw.columns)}")
+        raise ValueError(f"El CSV debe tener al menos 2 columnas. Detectadas: {list(raw.columns)}")
 
-    # 2) Tomar SOLO las dos primeras columnas
     df = raw.iloc[:, :2].copy()
     df.columns = ["COL_FECHA_RAW", "COL_PRECIO_RAW"]
 
-    # 3) Parsear fecha: origen viene como Mes/Día/Año (month-first)
-    #    Guardamos fecha datetime para cálculo y una versión string D/M/Y para visual
-    df["FECHA"] = pd.to_datetime(df["COL_FECHA_RAW"], errors="coerce", dayfirst=False, infer_datetime_format=True)
+    # Fecha dd.mm.yyyy -> datetime
+    df["FECHA"] = pd.to_datetime(
+        df["COL_FECHA_RAW"].astype(str).str.strip(),
+        format="%d.%m.%Y",
+        errors="coerce"
+    )
     df["FECHA_DMY"] = df["FECHA"].dt.strftime("%d/%m/%Y")
 
-    # 4) Limpiar precio -> float (quita comas de miles, $, %, guiones largos)
-    s = df["COL_PRECIO_RAW"].astype(str)
-    s = (s.str.replace(",", "", regex=False)
-           .str.replace("%", "", regex=False)
-           .str.replace("$", "", regex=False)
-           .str.replace("—", "", regex=False)
-           .str.strip())
-    df["AZUCAR_B"] = pd.to_numeric(s, errors="coerce")
+    # Precio con coma decimal -> float (punto)
+    df["AZUCAR_B"] = df["COL_PRECIO_RAW"].apply(parse_decimal_comma)
 
-    # 5) Filtrar filas válidas y ordenar ASC por fecha
+    # Limpiar y ordenar
     df = df.loc[df["FECHA"].notna() & df["AZUCAR_B"].notna(), ["FECHA", "FECHA_DMY", "AZUCAR_B"]]
     df = df.drop_duplicates(subset=["FECHA"]).sort_values("FECHA").reset_index(drop=True)
 
     if df.empty:
-        raise ValueError("Después de limpiar, no quedaron datos válidos. Revisa el formato de fecha y precio.")
+        raise ValueError("Sin datos válidos tras limpiar. Revisa formato de fecha (dd.mm.yyyy) y precio (coma decimal).")
     return df
 
 # ---- Ejecución principal ----
@@ -140,10 +174,8 @@ if csv_file:
         st.error(f"Error preparando el CSV: {e}")
         st.stop()
 
-    # Verificación rápida del rango de fechas
-    st.caption(f"Datos desde {df['FECHA'].min().date()} hasta {df['FECHA'].max().date()} (formato mostrado: D/M/Y)")
+    st.caption(f"Datos desde {df['FECHA'].min().date()} hasta {df['FECHA'].max().date()} (D/M/Y)")
 
-    # Inputs de franja (piso/techo)
     col1, col2 = st.columns(2)
     piso = col1.number_input("Precio PISO (USD/t)", value=595.0)
     techo = col2.number_input("Precio TECHO (USD/t)", value=683.0)
@@ -153,7 +185,6 @@ if csv_file:
         st.stop()
 
     if st.button("Ejecutar pronóstico"):
-        # Usar SIEMPRE la fecha máxima (por si el CSV viene en orden descendente)
         last_date = df["FECHA"].max()
 
         ini_hab, fin_hab = quincena_siguiente(last_date)
@@ -162,13 +193,11 @@ if csv_file:
             st.error("No hay días hábiles en la próxima quincena.")
             st.stop()
 
-        # Escalar y validar ventana
         vals_scaled = scaler.transform(df[["AZUCAR_B"]]).ravel()
         if len(vals_scaled) < LOOK_BACK:
             st.error(f"Datos insuficientes para LOOK_BACK={LOOK_BACK}. Proporciona más histórico.")
             st.stop()
 
-        # Predicción recursiva para cada día hábil de la quincena
         seq = vals_scaled[-LOOK_BACK:].reshape(1, LOOK_BACK, 1)
         preds_s = []
         for _ in range(len(fechas_q)):
@@ -182,17 +211,21 @@ if csv_file:
             "FECHA_DMY": pd.to_datetime(fechas_q).strftime("%d/%m/%Y"),
             "PRONOSTICO_AZUCAR_B": preds
         })
+
         prom_q = float(forecast_df["PRONOSTICO_AZUCAR_B"].mean())
         ar = calcular_arancel(prom_q, piso, techo)
 
-        st.subheader("📅 Próxima quincena hábil")
+        st.subheader("Próxima quincena hábil")
         st.write(f"Última fecha en datos: **{last_date.strftime('%d/%m/%Y')}**")
         st.write(f"{ini_hab.strftime('%d/%m/%Y')} → {fin_hab.strftime('%d/%m/%Y')}  (n={len(fechas_q)})")
 
-        st.subheader("📈 Pronóstico diario")
-        st.dataframe(forecast_df[["FECHA_DMY", "PRONOSTICO_AZUCAR_B"]].rename(columns={"FECHA_DMY": "FECHA (D/M/Y)"}))
+        st.subheader("Pronóstico diario")
+        st.dataframe(
+            forecast_df[["FECHA_DMY", "PRONOSTICO_AZUCAR_B"]]
+            .rename(columns={"FECHA_DMY": "FECHA (D/M/Y)", "PRONOSTICO_AZUCAR_B": "CR Pronosticado (USD/t)"})
+        )
 
-        st.subheader("💰 Promedio quincenal pronosticado (CR)")
+        st.subheader("Promedio quincenal pronosticado (CR)")
         st.metric(label="CR promedio (USD/t)", value=round(prom_q, 4))
 
         tabla = pd.DataFrame({
@@ -210,12 +243,17 @@ if csv_file:
             ]]
         })
 
-        st.subheader("📊 Resumen de arancel y costos")
+        st.subheader("Resumen de arancel y costos")
         st.dataframe(tabla)
 
+        # Exporta con punto decimal
         st.download_button(
             label="Descargar pronóstico en CSV",
-            data=forecast_df[["FECHA_DMY", "PRONOSTICO_AZUCAR_B"]].rename(columns={"FECHA_DMY": "FECHA"}).to_csv(index=False).encode("utf-8"),
+            data=forecast_df[["FECHA_DMY", "PRONOSTICO_AZUCAR_B"]]
+                 .rename(columns={"FECHA_DMY": "FECHA", "PRONOSTICO_AZUCAR_B": "CR_Pronosticado_USD_t"})
+                 .to_csv(index=False).encode("utf-8"),
             file_name="pronostico_quincena_proxima.csv",
             mime="text/csv"
         )
+else:
+    st.info("Carga un CSV con Fecha **dd.mm.yyyy** y Precio con **coma decimal** (ej.: 491,40).")
