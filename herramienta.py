@@ -69,7 +69,7 @@ def calcular_arancel(CR, piso, techo, flete=FLETE_USD, seguro_pct=SEGURO_PCT, ae
 
 # --- Configuración de la app ---
 st.set_page_config(page_title="Pronóstico y Arancel Azúcar B", layout="wide")
-st.markdown("<h1 style='text-align: center;'>Pronóstico del arancel de importación de azúcar origen Brasil</h1>", unsafe_allow_html=True)
+st.markdown("<h1 style='text-align: center;'>HERRAMIENTA: CÁLCULO DEL ARANCEL DE IMPORTACIÓN DE AZÚCAR ORIGEN BRASIL</h1>", unsafe_allow_html=True)
 st.markdown("<hr>", unsafe_allow_html=True)
 
 # --- Cargar modelo y scaler ---
@@ -130,6 +130,7 @@ def _load_and_normalize_csv(file) -> pd.DataFrame:
 # --- Interfaz principal ---
 st.markdown("### Carga de archivo y parámetros")
 col_input, col_plot = st.columns([1, 2])
+
 with col_input:
     csv_file = st.file_uploader("Sube tu archivo CSV aquí", type=["csv"])
     piso_val = st.number_input("Precio PISO (USD/t)", value=595.0)
@@ -140,75 +141,66 @@ with col_plot:
     if csv_file:
         try:
             df = _load_and_normalize_csv(csv_file)
-            st.markdown("<h3 style='text-align: center;'>Gráfica de comportamiento histórico</h3>", unsafe_allow_html=True)
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=df["FECHA"], y=df["AZUCAR_B"], mode="lines+markers", name="Histórico"))
-            fig.update_layout(xaxis_title="Fecha", yaxis_title="USD/t", height=400)
-            st.plotly_chart(fig, use_container_width=True)
         except Exception as e:
             st.error(f"Error preparando el CSV: {e}")
             st.stop()
 
-# --- Ejecución del pronóstico ---
-if ejecutar and csv_file:
-    last_date = df["FECHA"].max()
-    ini_hab, fin_hab = quincena_siguiente(last_date)
-    fechas_q = pd.bdate_range(ini_hab, fin_hab, freq="B")
-    if len(fechas_q) == 0:
-        st.error("No hay días hábiles en la próxima quincena.")
-        st.stop()
+        if ejecutar:
+            last_date = df["FECHA"].max()
+            ini_hab, fin_hab = quincena_siguiente(last_date)
+            fechas_q = pd.bdate_range(ini_hab, fin_hab, freq="B")
+            vals_scaled = scaler.transform(df[["AZUCAR_B"]]).ravel()
+            seq = vals_scaled[-LOOK_BACK:].reshape(1, LOOK_BACK, 1)
+            preds_s = []
+            for _ in range(len(fechas_q)):
+                yhat = model.predict(seq, verbose=0)[0, 0]
+                preds_s.append(yhat)
+                seq = np.concatenate([seq[:, 1:, :], np.array([[[yhat]]])], axis=1)
+            preds = scaler.inverse_transform(np.array(preds_s).reshape(-1, 1)).ravel()
+            forecast_df = pd.DataFrame({
+                "FECHA": fechas_q,
+                "PRONOSTICO_AZUCAR_B": preds
+            })
 
-    vals_scaled = scaler.transform(df[["AZUCAR_B"]]).ravel()
-    if len(vals_scaled) < LOOK_BACK:
-        st.error(f"Datos insuficientes para LOOK_BACK={LOOK_BACK}.")
-        st.stop()
+            st.markdown("<h3 style='text-align: center;'>Comportamiento de la serie</h3>", unsafe_allow_html=True)
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=df["FECHA"], y=df["AZUCAR_B"], mode="lines+markers", name="Histórico", marker=dict(color="blue")))
+            fig.add_trace(go.Scatter(x=forecast_df["FECHA"], y=forecast_df["PRONOSTICO_AZUCAR_B"], mode="markers", name="Pronóstico", marker=dict(color="red", size=8)))
+            fig.update_layout(xaxis_title="Fecha", yaxis_title="USD/t", height=400)
+            st.plotly_chart(fig, use_container_width=True)
 
-    seq = vals_scaled[-LOOK_BACK:].reshape(1, LOOK_BACK, 1)
-    preds_s = []
-    for _ in range(len(fechas_q)):
-        yhat = model.predict(seq, verbose=0)[0, 0]
-        preds_s.append(yhat)
-        seq = np.concatenate([seq[:, 1:, :], np.array([[[yhat]]])], axis=1)
+            prom_q = float(forecast_df["PRONOSTICO_AZUCAR_B"].mean())
+            ar = calcular_arancel(prom_q, piso_val, techo_val)
 
-    preds = scaler.inverse_transform(np.array(preds_s).reshape(-1, 1)).ravel()
-    forecast_df = pd.DataFrame({
-        "FECHA": fechas_q,
-        "PRONOSTICO_AZUCAR_B": preds
-    })
+            st.markdown("<h3 style='text-align: center;'>Resultados del pronóstico</h3>", unsafe_allow_html=True)
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric(label="CR promedio (USD/t)", value=round(prom_q, 4))
+                st.dataframe(
+                    forecast_df[["FECHA", "PRONOSTICO_AZUCAR_B"]]
+                    .rename(columns={"FECHA": "Fecha", "PRONOSTICO_AZUCAR_B": "CR Pronosticado (USD/t)"})
+                )
+            with col2:
+                st.metric(label="Arancel DIAN (%)", value=round(ar["Arancel_DIAN_pct"], 4))
+                resumen = pd.DataFrame({
+                    "Detalle": [
+                        "CR [USD/t]", "CIF [USD/t]", "AEC [%]",
+                        "Derecho variable [%]", "Rebaja [%]",
+                        "Arancel DIAN [%]", "Arancel efectivamente pagado [%]"
+                    ],
+                    "Valor": [round(ar[k], 4) for k in [
+                        "CR", "CIF", "AEC_pct",
+                        "Derecho_variable_pct", "Rebaja_pct",
+                        "Arancel_DIAN_pct", "Arancel_ALADI_pct"
+                    ]]
+                })
+                st.dataframe(resumen)
 
-    prom_q = float(forecast_df["PRONOSTICO_AZUCAR_B"].mean())
-    ar = calcular_arancel(prom_q, piso_val, techo_val)
-
-    st.markdown("### Resultados del pronóstico")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric(label="CR promedio (USD/t)", value=round(prom_q, 4))
-        st.dataframe(
-            forecast_df[["FECHA", "PRONOSTICO_AZUCAR_B"]]
-            .rename(columns={"FECHA": "Fecha", "PRONOSTICO_AZUCAR_B": "CR Pronosticado (USD/t)"})
-        )
-
-    with col2:
-        st.metric(label="Arancel DIAN (%)", value=round(ar["Arancel_DIAN_pct"], 4))
-        resumen = pd.DataFrame({
-            "Detalle": [
-                "CR [USD/t]", "CIF [USD/t]", "AEC [%]",
-                "Derecho variable [%]", "Rebaja [%]",
-                "Arancel DIAN [%]", "Arancel efectivamente pagado [%]"
-            ],
-            "Valor": [round(ar[k], 4) for k in [
-                "CR", "CIF", "AEC_pct",
-                "Derecho_variable_pct", "Rebaja_pct",
-                "Arancel_DIAN_pct", "Arancel_ALADI_pct"
-            ]]
-        })
-        st.dataframe(resumen)
-
-    st.download_button(
-        label="Descargar pronóstico en CSV",
-        data=forecast_df[["FECHA", "PRONOSTICO_AZUCAR_B"]]
-            .rename(columns={"FECHA": "Fecha", "PRONOSTICO_AZUCAR_B": "CR_Pronosticado_USD_t"})
-            .to_csv(index=False).encode("utf-8"),
-        file_name="pronostico_quincena_proxima.csv",
-        mime="text/csv"
-    )
+            st.download_button(
+                label="Descargar pronóstico en CSV",
+                data=forecast_df[["FECHA", "PRONOSTICO_AZUCAR_B"]]
+                    .rename(columns={"FECHA": "Fecha", "PRONOSTICO_AZUCAR_B": "CR_Pronosticado_USD_t"})
+                    .to_csv(index=False).encode("utf-8"),
+                file_name="pronostico_quincena_proxima.csv",
+                mime="text/csv"
+            )
